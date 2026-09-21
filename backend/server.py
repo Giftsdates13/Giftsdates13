@@ -2499,35 +2499,52 @@ class VipSchedBookReq(BaseModel):
 def _vs_today():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-def _vs_conflict(ns: int, ne: int, existing: list) -> bool:
+def _vs_win(block):
+    """Start/end minutes of a VIP availability block. End is extended past 1440
+    when the window runs into the next day (end <= start)."""
+    S = _hm_to_min(block["start"]); E = _hm_to_min(block["end"])
+    if E <= S: E += 24 * 60
+    return S, E
+
+def _vs_norm(b, ref_start):
+    """Normalise a booking's [start,end] HH:MM into the day-frame of a block whose start
+    is ref_start. Times before ref_start (or an end <= start) roll into the next day."""
+    bs, be = _hm_to_min(b["start"]), _hm_to_min(b["end"])
+    if bs < ref_start: bs += 24 * 60
+    if be <= bs: be += 24 * 60
+    return bs, be
+
+def _vs_conflict(ns: int, ne: int, existing: list, ref_start: int = 0) -> bool:
     """A candidate [ns,ne] conflicts if it comes within VIP_SCHED_BUFFER minutes of any
-    existing active booking [bs,be]. This enforces a 15-min gap on both sides."""
+    existing active booking [bs,be]. This enforces a 15-min gap on both sides. Existing
+    bookings are normalised so past-midnight windows compare correctly."""
     for b in existing:
-        bs, be = _hm_to_min(b["start"]), _hm_to_min(b["end"])
+        bs, be = _vs_norm(b, ref_start)
         if ns < be + VIP_SCHED_BUFFER and bs < ne + VIP_SCHED_BUFFER:
             return True
     return False
 
 def _vs_gen_slots(block: dict, bookings: list):
     """Split a VIP availability block into consecutive slots of block.slot_len and tag each
-    with a visual state: available / pending / confirmed / locked."""
-    S, E = _hm_to_min(block["start"]), _hm_to_min(block["end"])
+    with a visual state: available / pending / confirmed / locked. Windows whose end is
+    <= start run past midnight into the next day."""
+    S, E = _vs_win(block)
     L = max(15, int(block.get("slot_len") or 60))
     out = []
     s = S
     while s + L <= E:
         e = s + L
         sf, st = _min_to_hm(s), _min_to_hm(e)
-        exact = next((b for b in bookings if b["start"] == sf and b["end"] == st), None)
+        exact = next((b for b in bookings if _vs_norm(b, S) == (s, e)), None)
         if exact and exact["status"] == "confirmed":
             state = "confirmed"
         elif exact and exact["status"] == "pending":
             state = "pending"
-        elif _vs_conflict(s, e, bookings):
+        elif _vs_conflict(s, e, bookings, ref_start=S):
             state = "locked"
         else:
             state = "available"
-        out.append({"start": sf, "end": st, "state": state, "slot_len": L})
+        out.append({"start": sf, "end": st, "state": state, "slot_len": L, "next_day": e > 24 * 60})
         s += L
     return out
 
@@ -2548,7 +2565,10 @@ async def _vs_autocomplete(vip_id: str):
     conf = await db.vip_sched.find({"vip_id": vip_id, "status": "confirmed"}).to_list(500)
     for b in conf:
         try:
-            end_dt = datetime.fromisoformat(f"{b['date']}T{b['end']}:00+00:00")
+            end_date = b["date"]
+            if str(b.get("end", "")) <= str(b.get("start", "")):  # ends after midnight → next calendar day
+                end_date = (datetime.fromisoformat(b["date"]) + timedelta(days=1)).strftime("%Y-%m-%d")
+            end_dt = datetime.fromisoformat(f"{end_date}T{b['end']}:00+00:00")
         except Exception:
             continue
         if end_dt <= now:
@@ -2591,10 +2611,11 @@ async def vs_add_availability(req: VipAvailReq, user=Depends(get_current_user)):
     if req.date < _vs_today():
         raise HTTPException(400, "DATE_PAST")
     s, e = _hm_to_min(req.start), _hm_to_min(req.end)
-    if s >= e:
+    if s == e:
         raise HTTPException(400, "BAD_WINDOW")
+    span = e - s if e > s else e + 24 * 60 - s  # window may run past midnight into the next day
     slot_len = max(15, min(240, int(req.slot_len or 60)))
-    if e - s < slot_len:
+    if span < slot_len:
         raise HTTPException(400, "WINDOW_TOO_SHORT")
     doc = {"id": str(uuid.uuid4()), "vip_id": user["id"], "date": req.date,
            "start": _min_to_hm(s), "end": _min_to_hm(e), "slot_len": slot_len,
@@ -2649,25 +2670,33 @@ async def vs_book(vip_id: str, req: VipSchedBookReq, user=Depends(get_current_us
     if (user.get("coins", 0) + user.get("withdrawable", 0)) < req.coins:
         raise HTTPException(400, "Insufficient coins")
     ns, ne = _hm_to_min(req.start), _hm_to_min(req.end)
-    if ns >= ne:
+    if ns == ne:
         raise HTTPException(400, "BAD_TIME")
-    # 1) the requested slot must fall inside one of the VIP's availability blocks
+    # 1) the requested slot must fall inside one of the VIP's availability blocks (which may run past midnight)
     blocks = await db.vip_avail.find({"vip_id": vip_id, "date": req.date}, {"_id": 0}).to_list(200)
-    fits = any(_hm_to_min(b["start"]) <= ns and ne <= _hm_to_min(b["end"]) for b in blocks)
-    if not fits:
+    ref_start = None; cs = ce = None
+    for b in blocks:
+        S, E = _vs_win(b)
+        a = ns + 24 * 60 if ns < S else ns
+        z = ne
+        if z < S or z <= a: z += 24 * 60
+        if S <= a and z <= E and a < z:
+            ref_start, cs, ce = S, a, z
+            break
+    if ref_start is None:
         raise HTTPException(400, "TIME_UNAVAILABLE")
     # 2) re-validate against active bookings immediately before creating (double-booking guard)
     active = await db.vip_sched.find({"vip_id": vip_id, "date": req.date, "status": {"$in": VIP_SCHED_ACTIVE}},
                                      {"_id": 0, "start": 1, "end": 1}).to_list(500)
-    if _vs_conflict(ns, ne, active):
+    if _vs_conflict(cs, ce, active, ref_start=ref_start):
         raise HTTPException(409, "SLOT_TAKEN")
     now = datetime.now(timezone.utc)
     tz = req.tz or (blocks[0]["tz"] if blocks else (target.get("timezone") or "UTC"))
     bid = str(uuid.uuid4())
     doc = {"id": bid, "vip_id": vip_id, "requester_id": user["id"],
            "date": req.date, "start": req.start, "end": req.end,
-           "lock_start": _min_to_hm(max(0, ns - VIP_SCHED_BUFFER)),
-           "lock_end": _min_to_hm(ne + VIP_SCHED_BUFFER),
+           "lock_start": _min_to_hm(max(0, cs - VIP_SCHED_BUFFER)),
+           "lock_end": _min_to_hm(ce + VIP_SCHED_BUFFER),
            "activity": (req.activity or "").strip(), "venue": (req.venue or "").strip(),
            "coins": int(req.coins), "status": "pending", "tz": tz,
            "created_at": now.isoformat(), "scheduled_at": f"{req.date}T{req.start}:00"}
@@ -2768,10 +2797,11 @@ async def vs_add_recurring(req: VipRecurringReq, user=Depends(get_current_user))
     if not wds:
         raise HTTPException(400, "NO_WEEKDAYS")
     s, e = _hm_to_min(req.start), _hm_to_min(req.end)
-    if s >= e:
+    if s == e:
         raise HTTPException(400, "BAD_WINDOW")
+    span = e - s if e > s else e + 24 * 60 - s  # window may run past midnight into the next day
     slot_len = max(15, min(240, int(req.slot_len or 60)))
-    if e - s < slot_len:
+    if span < slot_len:
         raise HTTPException(400, "WINDOW_TOO_SHORT")
     weeks = max(1, min(26, int(req.weeks or 8)))
     tz = (req.tz or user.get("timezone") or "UTC")
@@ -2808,21 +2838,29 @@ async def vs_reschedule(bid: str, req: VipRescheduleReq, user=Depends(get_curren
     if b["status"] != "pending":
         raise HTTPException(400, "NOT_PENDING")
     ns, ne = _hm_to_min(req.start), _hm_to_min(req.end)
-    if ns >= ne:
+    if ns == ne:
         raise HTTPException(400, "BAD_TIME")
     vip_id = b["vip_id"]
     blocks = await db.vip_avail.find({"vip_id": vip_id, "date": req.date}, {"_id": 0}).to_list(200)
-    fits = any(_hm_to_min(bl["start"]) <= ns and ne <= _hm_to_min(bl["end"]) for bl in blocks)
-    if not fits:
+    ref_start = None; cs = ce = None
+    for bl in blocks:
+        S, E = _vs_win(bl)
+        a = ns + 24 * 60 if ns < S else ns
+        z = ne
+        if z < S or z <= a: z += 24 * 60
+        if S <= a and z <= E and a < z:
+            ref_start, cs, ce = S, a, z
+            break
+    if ref_start is None:
         raise HTTPException(400, "TIME_UNAVAILABLE")
     active = await db.vip_sched.find({"vip_id": vip_id, "date": req.date, "status": {"$in": VIP_SCHED_ACTIVE}, "id": {"$ne": bid}},
                                      {"_id": 0, "start": 1, "end": 1}).to_list(500)
-    if _vs_conflict(ns, ne, active):
+    if _vs_conflict(cs, ce, active, ref_start=ref_start):
         raise HTTPException(409, "SLOT_TAKEN")
     now = datetime.now(timezone.utc).isoformat()
     await db.vip_sched.update_one({"id": bid}, {"$set": {
         "date": req.date, "start": req.start, "end": req.end,
-        "lock_start": _min_to_hm(max(0, ns - VIP_SCHED_BUFFER)), "lock_end": _min_to_hm(ne + VIP_SCHED_BUFFER),
+        "lock_start": _min_to_hm(max(0, cs - VIP_SCHED_BUFFER)), "lock_end": _min_to_hm(ce + VIP_SCHED_BUFFER),
         "scheduled_at": f"{req.date}T{req.start}:00", "rescheduled_at": now, "reminder_30_sent": False}})
     await notify(vip_id, "vs_rescheduled", "Date request updated 🔁",
                  f"{user['name']} proposed a new time: {req.date} · {req.start}–{req.end}. Confirm or decline in VIP Bookings.",
@@ -2846,7 +2884,10 @@ def _vs_end_dt(b: dict):
     except Exception:
         tzinfo = ZoneInfo("UTC")
     try:
-        return datetime.fromisoformat(f"{b['date']}T{b['end']}:00").replace(tzinfo=tzinfo).astimezone(timezone.utc)
+        end_date = b["date"]
+        if str(b.get("end", "")) <= str(b.get("start", "")):  # ends after midnight → next calendar day
+            end_date = (datetime.fromisoformat(b["date"]) + timedelta(days=1)).strftime("%Y-%m-%d")
+        return datetime.fromisoformat(f"{end_date}T{b['end']}:00").replace(tzinfo=tzinfo).astimezone(timezone.utc)
     except Exception:
         return None
 

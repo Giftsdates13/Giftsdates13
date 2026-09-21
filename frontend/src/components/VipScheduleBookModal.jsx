@@ -132,7 +132,7 @@ export default function VipScheduleBookModal({ open, onOpenChange, target, defau
                         onClick={() => selectable && setSlot(s)}
                         data-testid={`vs-book-slot-${s.start}`}
                         className={`rounded-lg border px-2 py-2 text-xs font-mono-num transition-colors ${active ? "bg-rose-500 border-rose-500 text-white" : STATE_STYLE[s.state]}`}>
-                        <div>{s.start}–{s.end}</div>
+                        <div>{s.start}–{s.end}{s.next_day ? <span className="ml-0.5 text-sky-300/90">+1</span> : ""}</div>
                         {!selectable && <div className="text-[9px] mt-0.5 no-underline">{STATE_LABEL[s.state]}</div>}
                       </button>
                     );

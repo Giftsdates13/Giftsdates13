@@ -107,6 +107,20 @@ backend:
         -working: true
         -agent: "testing"
         -comment: "✅ OVERNIGHT AVAILABILITY FEATURE FULLY WORKING (ALL TESTS PASSED 8/8). Tested complete flow: 1) Registered two users (userA, userB) via POST /api/auth/register. 2) As userA, PATCH /api/auth/me with availability_time={from:'22:00',to:'02:00'} and availability=[future date 3 days out] → 200 OK (overnight window accepted). Verified profile saved these values correctly. 3) As userA, PATCH /api/auth/me with availability_time={from:'18:00',to:'18:00'} (equal from==to) → 400 'Invalid time window' (correctly rejected). Restored overnight window. 4) GET /api/profiles/{userA_id}/availability as userB → 200 OK, time_window={from:'22:00',to:'02:00'}, available_days contains future date. No errors. 5) Added 500 coins to userB via database (register grants 0 coins). 6) POST /api/dates/book from userB to userA with scheduled_at=<future date>T22:00:00, local_time='23:00', activities=[3 strings], coins=150, venue/city/address/country/postal_code → 200 OK, status='escrow', booking_id returned. Verified stored booking: slot_from='23:00', slot_to='01:30' (date ends after midnight next day). 7) NEGATIVE TEST: POST /api/dates/book with local_time='01:00' on same day → 400 'TIME_UNAVAILABLE:22:00-02:00' (correctly rejected - only 60 min remain before 02:00, 2.5h/150-min date won't fit). 8) REGRESSION TEST: Set userA availability_time={from:'18:00',to:'23:00'} for different future date, POST /api/dates/book from userB at local_time='18:00' → 200 OK, slot_from='18:00', slot_to='20:30' (normal same-day windows still work). Test file: /app/backend_overnight_availability_test.py. Test users: userA_fbe47c9a@example.com (ID: 4c2309ed-4101-4f77-9d05-3804e90301a5), userB_32cd6225@example.com (ID: 10e19ffb-e8f7-4f24-9d57-ed920c7e68e9). NO ISSUES FOUND."
+  - task: "VIP schedule availability crossing midnight (overnight slots into next day)"
+    implemented: true
+    working: true
+    file: "server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        -working: "NA"
+        -agent: "main"
+        -comment: "Added overnight support to the VIP schedule (vip_avail blocks + vip_sched bookings). Changes: (1) Added _vs_win(block) (extends end by 1440 when end<=start) and _vs_norm(booking, ref_start) to normalize past-midnight times. (2) _vs_conflict now takes ref_start and normalizes existing bookings. (3) _vs_gen_slots handles overnight windows and tags each slot next_day=(end>1440). (4) POST /api/vip/schedule/availability and /recurring now allow overnight windows (reject only start==end; span computed across midnight). (5) POST /api/vip/schedule/{vip}/book and /bookings/{bid}/reschedule now fit slots into overnight blocks (block-relative normalization) and conflict-check with ref_start; lock_start/lock_end computed from normalized minutes. (6) _vs_autocomplete and _vs_end_dt compute end on the next calendar day when end<=start (so overnight confirmed dates aren't auto-completed early). TEST (requires VIP user — set is_vip via DB or existing VIP flag): (a) As VIP userA, POST /api/vip/schedule/availability {date:<future>, start:'22:00', end:'02:00', slot_len:60} → 200 (previously BAD_WINDOW). (b) start==end (e.g. 18:00/18:00) → 400 BAD_WINDOW. (c) GET /api/vip/schedule/{A}/slots as userB → the date has slots including 22:00-23:00, 23:00-00:00, 00:00-01:00 (next_day:true), 01:00-02:00 (next_day:true). (d) POST /api/vip/schedule/{A}/book from userB with start:'00:00', end:'01:00', coins>0 → 200 status pending (must have coins). (e) book start:'01:30' end:'02:30' → 400 TIME_UNAVAILABLE (exceeds window). (f) Regression: normal block start:'09:00' end:'12:00' still works and books normally. NOTE: user must be VIP (is_vip) — check helper is_vip and set the VIP flag on userA in DB if needed."
+        -working: true
+        -agent: "testing"
+        -comment: "✅ VIP SCHEDULE OVERNIGHT AVAILABILITY FEATURE FULLY WORKING (ALL TESTS PASSED 8/8). Tested complete flow: 1) Registered two users (userA as VIP host, userB as booker) via POST /api/auth/register. 2) Made userA VIP by setting vip_until field in MongoDB to 30 days in future (is_vip helper checks vip_until > now). 3) Gave userB 500 coins via MongoDB (register grants 0 coins). 4) As userA (VIP), POST /api/vip/schedule/availability with {date:<future date 3 days out>, start:'22:00', end:'02:00', slot_len:60} → 200 OK (overnight window accepted, previously rejected with BAD_WINDOW). Verified block stored correctly with start='22:00', end='02:00'. 5) As userA, POST /api/vip/schedule/availability with {date:<another future date>, start:'18:00', end:'18:00', slot_len:60} (equal start==end) → 400 BAD_WINDOW (correctly rejected). 6) GET /api/vip/schedule/{userA_id}/slots as userB → 200 OK. For overnight date, verified slots include: 22:00-23:00 (next_day:false, state:available), 23:00-00:00 (next_day:false, state:available), 00:00-01:00 (next_day:true, state:available), 01:00-02:00 (next_day:true, state:available). All slots correctly tagged with next_day flag. 7) As userB, POST /api/vip/schedule/{userA_id}/book with {date:<overnight date>, start:'00:00', end:'01:00', coins:300, activity:'Dinner', tz:'UTC'} → 200 OK, status='pending'. Verified booking stored in vip_sched collection with start='00:00', end='01:00' (slot that starts after midnight, next day). 8) NEGATIVE TEST: As userB, POST /api/vip/schedule/{userA_id}/book with {date:<overnight date>, start:'01:30', end:'02:30', coins:300} → 400 TIME_UNAVAILABLE (correctly rejected - 02:30 exceeds the 02:00 window end). 9) REGRESSION TEST: As userA, POST /api/vip/schedule/availability {date:<third future date>, start:'09:00', end:'12:00', slot_len:60} → 200 OK. GET slots → normal slots 09:00-10:00, 10:00-11:00, 11:00-12:00 with next_day:false. As userB, book start:'09:00' end:'10:00' coins:300 → 200 OK, status='pending' (normal same-day windows still work). Test file: /app/backend_vip_overnight_test.py. Test users: vip_test_cf2435b0@example.com (VIP, ID: 6ab52f99-c06c-429e-99cd-2d28f2c89e66), vip_test_afcad75f@example.com (Booker, ID: 65269439-9e9a-47fa-9413-16437a5e427b). VIP setup: Set vip_until in MongoDB users collection. Coins: Added via MongoDB users collection (coins field). NO ISSUES FOUND."
 
 
 backend:
@@ -180,6 +194,10 @@ agent_communication:
     -message: "Restored the GiftsDates full-stack app from the user's GitHub repo. Please verify core auth works: POST register (create a user with email/password), then POST login returns a JWT/token, and an authenticated /api/me (or equivalent) works. Also smoke-test a couple of key GET endpoints. Do NOT test Stripe payments (no keys) or email sending. Report which auth endpoints exist and whether they function."
     -agent: "testing"
     -message: "✅ ALL CORE AUTH TESTS PASSED (7/7). The GiftsDates authentication system is fully functional after restore. ENDPOINTS DISCOVERED: POST /api/auth/register (creates user, returns JWT), POST /api/auth/login (authenticates, returns JWT), GET /api/auth/me (returns current user with Bearer token). FLOW VERIFIED: register -> login -> authenticated request works end-to-end. PUBLIC ENDPOINTS TESTED: /api/meta, /api/support/config, /api/spin/config all working. JWT_SECRET properly configured. MongoDB connection working. User data persists correctly. NO ISSUES FOUND. The 'saving all logins' requirement is satisfied - auth system fully operational."
+    -agent: "main"
+    -message: "NEW FEATURE TO TEST: VIP schedule availability windows that pass midnight into the next day (overnight VIP availability). Focus ONLY on this feature. Backend URL: read from /app/frontend/.env REACT_APP_BACKEND_URL. All routes prefixed with /api. Do NOT test Stripe/payments. Context: The VIP schedule uses collection vip_avail (availability blocks with fields date, start, end, slot_len) and vip_sched (bookings). The endpoints require the acting user to be VIP (is_vip helper in /app/backend/server.py). Inspect server.py to understand is_vip and how to make a user VIP — you will likely need to set the VIP flag directly in MongoDB (DB from backend/.env MONGO_URL and DB_NAME) on the test user (e.g. set fields that is_vip checks, such as vip=True / vip_until in the future). Coins can also be granted via DB (users collection: coins field), since register grants 0. Steps: 1. Register userA (will be VIP host) and userB (booker) via POST /api/auth/register. Get ids via GET /api/auth/me. 2. Make userA a VIP by updating the users document in MongoDB according to what is_vip() checks. Give userB ~500 coins in DB. 3. As userA, POST /api/vip/schedule/availability with {date:<a future date YYYY-MM-DD, e.g. 3 days out>, start:'22:00', end:'02:00', slot_len:60}. EXPECT 200 OK (previously rejected with BAD_WINDOW). Confirm the block is stored (start '22:00', end '02:00'). 4. As userA, POST /api/vip/schedule/availability with {date:<another future date>, start:'18:00', end:'18:00', slot_len:60} (equal start==end). EXPECT 400 BAD_WINDOW. 5. GET /api/vip/schedule/{userA_id}/slots as userB. EXPECT 200. For the overnight date, verify slots include 22:00-23:00, 23:00-00:00, 00:00-01:00, 01:00-02:00 and that the 00:00 and 01:00 slots have 'next_day': true. All should be state 'available'. 6. As userB, POST /api/vip/schedule/{userA_id}/book with {date:<overnight date>, start:'00:00', end:'01:00', coins:300, activity:'Dinner', tz:'UTC'}. EXPECT 200, status 'pending' (this is a slot that starts after midnight, next day). Verify booking stored with start '00:00', end '01:00'. 7. NEGATIVE: As userB, POST /api/vip/schedule/{userA_id}/book with {date:<overnight date>, start:'01:30', end:'02:30', coins:300}. EXPECT 400 TIME_UNAVAILABLE (02:30 is beyond the 02:00 window end). 8. REGRESSION: As userA POST /api/vip/schedule/availability {date:<a third future date>, start:'09:00', end:'12:00', slot_len:60} → EXPECT 200. GET slots → normal 09:00-10:00 etc slots with next_day false. As userB book start:'09:00' end:'10:00' coins:300 → EXPECT 200 pending. Inspect /app/backend/server.py functions: vs_add_availability (~line 2585), _vs_win, _vs_gen_slots, _vs_conflict, vs_book (POST /api/vip/schedule/{vip_id}/book ~line 2657), vs_public_slots (~line 2636). Report clearly each step pass/fail with actual responses, and note exactly how you made the user VIP."
+    -agent: "testing"
+    -message: "✅ VIP SCHEDULE OVERNIGHT AVAILABILITY TEST COMPLETE - ALL TESTS PASSED (8/8). The VIP schedule overnight availability feature is fully functional. FLOW VERIFIED: Complete VIP schedule overnight availability testing from user registration → VIP setup → availability creation → slot verification → booking → negative test → regression test. ENDPOINTS TESTED: POST /api/auth/register (create users), GET /api/auth/me (get user IDs), POST /api/vip/schedule/availability (create availability blocks), GET /api/vip/schedule/{vip_id}/slots (get bookable slots), POST /api/vip/schedule/{vip_id}/book (book slots). VERIFIED: (1) Registered userA (VIP host) and userB (booker). (2) Made userA VIP by setting vip_until field in MongoDB users collection to 30 days in future (is_vip helper checks if vip_until > now). (3) Gave userB 500 coins via MongoDB users collection (register grants 0 coins). (4) Overnight availability (22:00-02:00) accepted: POST /api/vip/schedule/availability → 200 OK, block stored with start='22:00', end='02:00' (previously rejected with BAD_WINDOW). (5) Equal start==end (18:00-18:00) correctly rejected: 400 BAD_WINDOW. (6) GET /api/vip/schedule/{userA_id}/slots → 200 OK, overnight date has 4 slots: 22:00-23:00 (next_day:false), 23:00-00:00 (next_day:false), 00:00-01:00 (next_day:true), 01:00-02:00 (next_day:true), all state:available. (7) Booking overnight slot (00:00-01:00): POST /api/vip/schedule/{userA_id}/book → 200 OK, status='pending', booking stored in vip_sched with start='00:00', end='01:00'. (8) NEGATIVE TEST: Booking slot exceeding window (01:30-02:30) → 400 TIME_UNAVAILABLE (correctly rejected, 02:30 exceeds 02:00 window end). (9) REGRESSION TEST: Normal window (09:00-12:00) → 200 OK, slots have next_day:false, booking 09:00-10:00 → 200 OK, status='pending'. NO ISSUES FOUND. Test users: vip_test_cf2435b0@example.com (VIP, ID: 6ab52f99-c06c-429e-99cd-2d28f2c89e66), vip_test_afcad75f@example.com (Booker, ID: 65269439-9e9a-47fa-9413-16437a5e427b). Test file: /app/backend_vip_overnight_test.py. VIP SETUP METHOD: Set vip_until field in MongoDB users collection to future date (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(). COINS SETUP: Add coins via MongoDB users collection, $inc: {coins: 500}."
 
 #====================================================================================================
 # Testing Data - Main Agent and testing sub agent both should log testing data below this section
@@ -855,3 +873,113 @@ INVITATION_SENT
 - ✅ Regression test passed (normal same-day windows still work)
 - ✅ All helper functions (_win_ok, _win_end_min, _min_to_hm, _booking_end_min, gen_slots) working correctly
 - ⚠️ Note: Register grants 0 coins, test added 500 coins via database for booking tests
+
+
+
+## Testing Session 7 - 2026-09-21
+**Testing Agent**: VIP Schedule Overnight Availability Feature Verification
+**Focus**: VIP schedule availability windows that pass midnight into the next day
+
+### Tests Executed:
+1. ✅ User Registration - POST /api/auth/register for userA (VIP host) and userB (booker)
+2. ✅ VIP Setup - Set vip_until field in MongoDB users collection to 30 days in future
+3. ✅ Coins Setup - Added 500 coins to userB via MongoDB users collection
+4. ✅ Overnight Availability Creation - POST /api/vip/schedule/availability with {date:<future>, start:"22:00", end:"02:00", slot_len:60} → 200 OK
+5. ✅ Equal Start==End Validation - POST /api/vip/schedule/availability with {date:<future>, start:"18:00", end:"18:00", slot_len:60} → 400 BAD_WINDOW
+6. ✅ Slots Verification - GET /api/vip/schedule/{vip_id}/slots → 200 OK, overnight slots with correct next_day flags
+7. ✅ Overnight Booking - POST /api/vip/schedule/{vip_id}/book with {date:<overnight date>, start:"00:00", end:"01:00", coins:300} → 200 OK, status:"pending"
+8. ✅ Negative Test - POST /api/vip/schedule/{vip_id}/book with {date:<overnight date>, start:"01:30", end:"02:30", coins:300} → 400 TIME_UNAVAILABLE
+9. ✅ Regression Test - Normal window (09:00-12:00) still works, booking 09:00-10:00 → 200 OK
+
+### Test Results: 9/9 PASSED (100%)
+
+### VIP Schedule Overnight Availability Feature Verified:
+- **POST /api/vip/schedule/availability**: Accepts overnight availability windows (end <= start)
+  - Overnight window (22:00-02:00): ✅ Accepted (200 OK)
+  - Equal start==end (18:00-18:00): ✅ Rejected (400 BAD_WINDOW)
+  - Block correctly stored with start="22:00", end="02:00"
+
+- **GET /api/vip/schedule/{vip_id}/slots**: Returns overnight slots with next_day flags
+  - Overnight date has 4 slots:
+    - 22:00-23:00 (next_day: false, state: available) ✅
+    - 23:00-00:00 (next_day: false, state: available) ✅
+    - 00:00-01:00 (next_day: true, state: available) ✅
+    - 01:00-02:00 (next_day: true, state: available) ✅
+
+- **POST /api/vip/schedule/{vip_id}/book**: Handles overnight bookings
+  - Booking overnight slot (00:00-01:00): ✅ Success
+    - Status: "pending" ✅
+    - Booking stored with start="00:00", end="01:00" ✅
+  - Booking slot exceeding window (01:30-02:30): ✅ Rejected
+    - Error: 400 TIME_UNAVAILABLE ✅
+    - Reason: 02:30 exceeds 02:00 window end ✅
+
+### Test Case 1: Overnight Window (22:00-02:00)
+- **UserA (VIP)**: vip_test_cf2435b0@example.com (ID: 6ab52f99-c06c-429e-99cd-2d28f2c89e66)
+- **UserB (Booker)**: vip_test_afcad75f@example.com (ID: 65269439-9e9a-47fa-9413-16437a5e427b)
+- **Available Date**: 2026-09-24
+- **Availability Block**: 22:00-02:00 (slot_len: 60)
+- **Booking**: 00:00-01:00 (overnight slot, starts after midnight)
+- **Booking ID**: 8f800c8a-3580-4c7e-893e-4afe37202f09
+- **Result**: ✅ Booking created successfully
+  - Status: pending
+  - Stored in vip_sched collection with start="00:00", end="01:00"
+
+### Test Case 2: Negative - Slot Exceeding Window
+- **Booking Time**: 01:30-02:30 (exceeds 02:00 window end)
+- **Expected**: 400 TIME_UNAVAILABLE
+- **Actual**: 400 TIME_UNAVAILABLE
+- **Result**: ✅ Correctly rejected (02:30 is beyond the 02:00 window end)
+
+### Test Case 3: Regression - Normal Same-Day Window
+- **Window**: 09:00-12:00
+- **Available Date**: 2026-09-26
+- **Booking Time**: 09:00-10:00
+- **Result**: ✅ Booking created successfully
+  - Status: pending
+  - All slots have next_day: false
+
+### Implementation Details Verified:
+1. **_vs_win function** (line 2502): Extends end by 1440 when end <= start (overnight windows)
+2. **_vs_norm function** (line 2509): Normalizes booking times for overnight windows
+3. **_vs_conflict function** (line 2517): Checks conflicts with ref_start normalization
+4. **_vs_gen_slots function** (line 2527): Generates slots, tags with next_day when e > 1440
+5. **POST /api/vip/schedule/availability** (line 2605): Allows overnight windows (rejects only start==end)
+6. **POST /api/vip/schedule/{vip_id}/book** (line 2661): Fits slots into overnight blocks with normalization
+7. **_vs_autocomplete function** (line 2562): Computes end on next calendar day when end <= start
+
+### VIP Setup Method:
+- **is_vip helper** (line 232): Checks if user has vip_until field in the future
+- **VIP Setup**: Set vip_until field in MongoDB users collection
+  ```python
+  vip_until = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+  db.users.update_one({"id": user_id}, {"$set": {"vip_until": vip_until}})
+  ```
+
+### Coins Setup Method:
+- **Register**: Grants 0 coins by default
+- **Coins Setup**: Add coins via MongoDB users collection
+  ```python
+  db.users.update_one({"id": user_id}, {"$inc": {"coins": 500}})
+  ```
+
+### Environment Verified:
+- Backend URL: https://secure-gifts-3.preview.emergentagent.com/api
+- MongoDB: localhost:27017, DB: test_database
+- Collections: vip_avail (availability blocks), vip_sched (bookings), users
+- All routes properly prefixed with /api
+- Test file: /app/backend_vip_overnight_test.py
+
+### Issues Found: NONE
+
+### Recommendations:
+- ✅ VIP schedule overnight availability feature is production-ready
+- ✅ Overnight windows (22:00-02:00) correctly accepted and stored
+- ✅ Equal start==end validation working correctly (rejected as BAD_WINDOW)
+- ✅ Slots endpoint returns correct overnight slots with next_day flags
+- ✅ Booking endpoint correctly handles overnight slots (00:00-01:00)
+- ✅ Negative test working (slots exceeding window correctly rejected)
+- ✅ Regression test passed (normal same-day windows still work)
+- ✅ All helper functions (_vs_win, _vs_norm, _vs_conflict, _vs_gen_slots) working correctly
+- ✅ VIP setup via vip_until field in MongoDB working correctly
+- ✅ Coins setup via MongoDB working correctly

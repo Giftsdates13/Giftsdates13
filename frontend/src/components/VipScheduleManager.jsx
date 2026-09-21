@@ -11,16 +11,19 @@ import { Switch } from "./ui/switch";
 const toKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 const fromKey = (k) => { const [y, m, d] = k.split("-").map(Number); return new Date(y, m - 1, d); };
 const hmMin = (s) => { const [h, m] = String(s || "0:0").split(":").map(Number); return (h || 0) * 60 + (m || 0); };
-const minHm = (x) => `${String(Math.floor(x / 60)).padStart(2, "0")}:${String(x % 60).padStart(2, "0")}`;
+const minHm = (x) => { const v = ((x % 1440) + 1440) % 1440; return `${String(Math.floor(v / 60)).padStart(2, "0")}:${String(v % 60).padStart(2, "0")}`; };
 const fmtDay = (d) => { try { return fromKey(d).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" }); } catch { return d; } };
+// End minute of a window, extended past midnight into the next day when end <= start.
+const winEnd = (start, end) => { const s = hmMin(start); let e = hmMin(end); if (e <= s) e += 1440; return e; };
+const crossesMidnight = (start, end) => hmMin(end) <= hmMin(start);
 
 const SLOT_LENGTHS = [30, 45, 60, 90, 120];
 const WEEKDAYS = [["Mon", 0], ["Tue", 1], ["Wed", 2], ["Thu", 3], ["Fri", 4], ["Sat", 5], ["Sun", 6]];
 
 function previewSlots(start, end, len) {
-  const s = hmMin(start), e = hmMin(end), L = Math.max(15, len);
+  const s = hmMin(start), e = winEnd(start, end), L = Math.max(15, len);
   const out = [];
-  for (let x = s; x + L <= e; x += L) out.push(`${minHm(x)}–${minHm(x + L)}`);
+  for (let x = s; x + L <= e; x += L) out.push({ label: `${minHm(x)}–${minHm(x + L)}`, nextDay: x + L > 1440 });
   return out;
 }
 
@@ -37,8 +40,8 @@ export default function VipScheduleManager({ blocks = [], onChanged }) {
   const toggleWeekday = (n) => setWeekdays((w) => w.includes(n) ? w.filter((x) => x !== n) : [...w, n]);
 
   const add = async () => {
-    if (hmMin(start) >= hmMin(end)) { toast.error("End time must be after start time"); return; }
-    if (hmMin(end) - hmMin(start) < slotLen) { toast.error("Window is shorter than one slot"); return; }
+    if (hmMin(start) === hmMin(end)) { toast.error("End time can't equal start time"); return; }
+    if (winEnd(start, end) - hmMin(start) < slotLen) { toast.error("Window is shorter than one slot"); return; }
     setSaving(true);
     try {
       if (repeat) {
@@ -99,6 +102,9 @@ export default function VipScheduleManager({ blocks = [], onChanged }) {
                 <Label className="text-[11px] text-slate-400">To</Label>
                 <Input data-testid="vs-avail-end" type="time" value={end} onChange={(e) => setEnd(e.target.value)} className="bg-white/5 border-white/10 h-9 w-28 mt-1" />
               </div>
+              {crossesMidnight(start, end) && (
+                <span data-testid="vs-avail-overnight" className="self-end pb-2 text-[11px] text-sky-300/90">🌙 next day (+1)</span>
+              )}
             </div>
             <div className="mt-3">
               <Label className="text-[11px] text-slate-400">Slot length</Label>
@@ -140,9 +146,12 @@ export default function VipScheduleManager({ blocks = [], onChanged }) {
             {preview.length > 0 && (
               <div className="mt-3">
                 <p className="text-[11px] text-slate-400 mb-1.5">Bookable slots ({preview.length})</p>
+                {crossesMidnight(start, end) && (
+                  <p className="text-[11px] text-sky-300/90 mb-1.5">🌙 This window runs past midnight — times marked +1 are on the next day.</p>
+                )}
                 <div className="flex flex-wrap gap-1.5">
                   {preview.slice(0, 14).map((s) => (
-                    <span key={s} className="text-[11px] px-2 py-0.5 rounded-md bg-emerald-500/15 border border-emerald-500/30 text-emerald-200 font-mono-num">{s}</span>
+                    <span key={s.label} className="text-[11px] px-2 py-0.5 rounded-md bg-emerald-500/15 border border-emerald-500/30 text-emerald-200 font-mono-num">{s.label}{s.nextDay ? <span className="ml-0.5 text-sky-300/90">+1</span> : ""}</span>
                   ))}
                 </div>
               </div>
@@ -165,7 +174,7 @@ export default function VipScheduleManager({ blocks = [], onChanged }) {
                       {byDate[d].sort((a, b) => a.start.localeCompare(b.start)).map((b) => (
                         <span key={b.id} data-testid={`vs-avail-block-${b.id}`} className="inline-flex items-center gap-1.5 text-[11px] px-2 py-1 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-emerald-200 font-mono-num">
                           {b.recurring ? <Repeat size={10} className="text-emerald-300" /> : null}
-                          {b.start}–{b.end} · {b.slot_len}m
+                          {b.start}–{b.end}{crossesMidnight(b.start, b.end) ? <span className="text-sky-300/90"> 🌙</span> : ""} · {b.slot_len}m
                           <button onClick={() => remove(b.id)} data-testid={`vs-avail-del-${b.id}`} className="text-rose-300 hover:text-rose-200"><Trash2 size={12} /></button>
                         </span>
                       ))}
