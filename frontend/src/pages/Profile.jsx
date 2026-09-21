@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ShieldCheck, Trash2, Eye, EyeOff, MapPin, Loader2, Lock, Video, VideoOff, Crown } from "lucide-react";
+import { ShieldCheck, Trash2, Eye, EyeOff, MapPin, Loader2, Lock, Video, VideoOff, Crown, Coffee } from "lucide-react";
 import { api } from "../lib/api";
 import { useApp } from "../context/AppContext";
 import { t } from "../lib/i18n";
@@ -19,6 +19,7 @@ import VipEditor from "../components/VipEditor";
 import CancelledDates from "../components/CancelledDates";
 import CountrySelect from "../components/CountrySelect";
 import CitySelect from "../components/CitySelect";
+import DeleteAccountModal from "../components/DeleteAccountModal";
 import { normalizeCountry } from "../lib/countries";
 import { matchCuratedCity } from "../lib/cities";
 
@@ -37,6 +38,7 @@ export default function Profile() {
   const [busy, setBusy] = useState(false);
   const [locating, setLocating] = useState(false);
   const [soundOn, setSoundOn] = useState(localStorage.getItem("gd_sound") !== "off");
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
 
   const detectMyLocation = async () => {
     setLocating(true);
@@ -65,11 +67,12 @@ export default function Profile() {
     catch { toast.error(t("failed", lang)); }
   };
 
-  const deleteAccount = async () => {
-    if (!window.confirm(t("delete_account_confirm", lang))) return;
-    if (!window.confirm(t("delete_account_confirm2", lang))) return;
-    try { await api.delete("/account"); toast.success(t("account_deleted_toast", lang)); logout(); nav("/"); }
-    catch (e) { toast.error(e.response?.data?.detail || t("failed", lang)); }
+  const takeBreak = async () => {
+    try {
+      await api.post("/account/pause");
+      toast.success(t("break_taken_toast", lang));
+      logout(); nav("/");
+    } catch (e) { toast.error(e.response?.data?.detail || t("failed", lang)); }
   };
 
   const save = async () => {
@@ -225,11 +228,15 @@ export default function Profile() {
           )}
           <div className="border-t border-rose-500/20 pt-4">
             <div className="text-sm font-semibold text-rose-300 mb-1 flex items-center gap-1.5"><Trash2 size={15}/> {t("danger_zone", lang)}</div>
-            <p className="text-xs text-slate-400 mb-3">{t("delete_account_note", lang)}</p>
-            <Button data-testid="profile-delete-account" variant="outline" onClick={deleteAccount} className="bg-rose-500/10 border-rose-500/40 text-rose-300 hover:bg-rose-500/20"><Trash2 size={14} className="me-1"/> {t("delete_account", lang)}</Button>
+            <p className="text-xs text-slate-400 mb-3">{t("danger_zone_note", lang)}</p>
+            <div className="flex flex-wrap gap-2.5">
+              <Button data-testid="profile-take-break" variant="outline" onClick={takeBreak} className="bg-amber-500/10 border-amber-500/40 text-amber-200 hover:bg-amber-500/20"><Coffee size={14} className="me-1"/> {t("take_break", lang)}</Button>
+              <Button data-testid="profile-delete-account" variant="outline" onClick={() => setDeleteModalOpen(true)} className="bg-rose-500/10 border-rose-500/40 text-rose-300 hover:bg-rose-500/20"><Trash2 size={14} className="me-1"/> {t("delete_account", lang)}</Button>
+            </div>
           </div>
         </div>
       </div>
+      <DeleteAccountModal open={deleteModalOpen} onOpenChange={setDeleteModalOpen} />
     </div>
   );
 }

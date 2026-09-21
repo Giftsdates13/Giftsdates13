@@ -644,6 +644,7 @@ async def _startup():
     import asyncio
     asyncio.create_task(_vs_reminder_loop())
     asyncio.create_task(_date_lifecycle_loop())
+    asyncio.create_task(_account_purge_loop())
     logging.info("GiftsDates backend ready")
 
 # ---------- Meta ----------
@@ -882,6 +883,7 @@ async def register(req: RegisterReq):
         "coins": 0,  # no welcome bonus (Spin & Win only)
         "escrow": 0.0, "withdrawable": 0.0,
         "premium_until": None, "verified": False,
+        "account_status": "ACTIVE",
         "referral_code": uid[:8].upper(), "referred_by": referrer["id"] if referrer else None,
         "referral_rewarded": False,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -911,6 +913,11 @@ async def login(req: LoginReq):
     bu = u.get("blocked_until")
     if bu and datetime.fromisoformat(bu.replace("Z", "+00:00")) > datetime.now(timezone.utc):
         raise HTTPException(403, f"BLOCKED:{bu}")
+    # Taking a break: logging back in instantly reactivates a PAUSED account (no data lost).
+    if u.get("account_status") == "PAUSED":
+        await db.users.update_one({"id": u["id"]}, {"$set": {"account_status": "ACTIVE"}, "$unset": {"paused_at": ""}})
+        u["account_status"] = "ACTIVE"
+    # PENDING_DELETION accounts stay logged in so the user can choose to Restore within the 30-day window.
     return {"token": make_token(u["id"]), "user": {k: v for k, v in u.items() if k not in ("password", "_id")}}
 
 @api.get("/auth/me")
@@ -1256,7 +1263,8 @@ async def list_profiles(
     online_nearby: bool = False,
     limit: int = 40, user=Depends(get_current_user)
 ):
-    conds = [{"id": {"$ne": user["id"]}}, {"age": {"$gte": min_age, "$lte": max_age}}]
+    conds = [{"id": {"$ne": user["id"]}}, {"age": {"$gte": min_age, "$lte": max_age}},
+             {"account_status": {"$nin": ["PAUSED", "PENDING_DELETION"]}}]
     advanced_used = any(v not in (None, "", "all", False) for v in (intent, min_height, max_height, kids, smoking, religion, drinking, income, language, orientation,
                                                                    hobby, job, min_weight, max_weight, bust_size, penis_size, max_date_price, premium_only, with_photos, verified_only, online_now,
                                                                    zodiac, available_date, video_calls,
@@ -1402,6 +1410,9 @@ async def profile_detail(pid: str, user=Depends(get_current_user)):
                 "liked_by_me": False, "conversation_id": None,
                 "gifts_total": 0, "gifts_count": 0, "top_givers": [],
             }
+        raise HTTPException(404, "Not found")
+    # Hide profiles that are on a break or scheduled for deletion from everyone except the owner.
+    if p.get("account_status") in ("PAUSED", "PENDING_DELETION") and pid != user["id"]:
         raise HTTPException(404, "Not found")
     p["is_premium"] = is_premium(p)
     p["is_vip"] = is_vip(p)
@@ -1749,6 +1760,7 @@ async def book_date(req: DateBookingReq, user=Depends(get_current_user)):
     if (user.get("coins", 0) + user.get("withdrawable", 0)) < req.coins: raise HTTPException(400, "Insufficient coins")
     target = await db.users.find_one({"id": req.target_id})
     if not target: raise HTTPException(404, "Recipient not found")
+    if target.get("account_status") in ("PAUSED", "PENDING_DELETION"): raise HTTPException(400, "RECIPIENT_UNAVAILABLE")
     now = datetime.now(timezone.utc).isoformat()
     # 3 mandatory custom date-idea options proposed by the inviter
     activities = [str(a).strip() for a in (req.activities or [])]
@@ -3063,9 +3075,10 @@ async def vip_cancel_subscription(user=Depends(get_current_user)):
     await db.users.update_one({"id": user["id"]}, {"$set": {"vip_auto_renew": False}})
     return {"cancelled": True, "auto_renew": False, "vip_until": user.get("vip_until")}
 
-@api.delete("/account")
-async def delete_account(user=Depends(get_current_user)):
-    uid = user["id"]
+ACCOUNT_GRACE_DAYS = 30
+
+async def _purge_user(uid: str):
+    """Permanently remove a user and all their related data from the database."""
     await db.likes.delete_many({"$or": [{"from_id": uid}, {"to_id": uid}]})
     await db.matches.delete_many({"$or": [{"a_id": uid}, {"b_id": uid}, {"users": uid}]})
     await db.notifications.delete_many({"user_id": uid})
@@ -3073,8 +3086,49 @@ async def delete_account(user=Depends(get_current_user)):
     await db.messages.delete_many({"$or": [{"from_id": uid}, {"to_id": uid}]})
     await db.spins.delete_many({"used_by": uid})
     await db.payout_accounts.delete_many({"user_id": uid})
+    await db.vip_avail.delete_many({"vip_id": uid})
+    await db.vip_sched.delete_many({"$or": [{"vip_id": uid}, {"requester_id": uid}]})
+    await db.date_bookings.delete_many({"$or": [{"from_id": uid}, {"to_id": uid}]})
     await db.users.delete_one({"id": uid})
+
+@api.delete("/account")
+async def delete_account(user=Depends(get_current_user)):
+    """Immediate hard delete (kept for compatibility). The UI now uses /account/delete-request."""
+    await _purge_user(user["id"])
     return {"deleted": True}
+
+@api.get("/account/status")
+async def account_status(user=Depends(get_current_user)):
+    return {"account_status": user.get("account_status") or "ACTIVE",
+            "deletion_scheduled_at": user.get("deletion_scheduled_at")}
+
+@api.post("/account/pause")
+async def account_pause(user=Depends(get_current_user)):
+    """Take a break: hide the profile everywhere but keep all data. Logging back in reactivates it."""
+    await db.users.update_one({"id": user["id"]},
+        {"$set": {"account_status": "PAUSED", "paused_at": datetime.now(timezone.utc).isoformat()},
+         "$unset": {"deletion_scheduled_at": "", "deletion_requested_at": ""}})
+    return {"account_status": "PAUSED"}
+
+@api.post("/account/delete-request")
+async def account_delete_request(user=Depends(get_current_user)):
+    """Schedule the account for permanent deletion after a 30-day grace period."""
+    now = datetime.now(timezone.utc)
+    purge_at = (now + timedelta(days=ACCOUNT_GRACE_DAYS)).isoformat()
+    await db.users.update_one({"id": user["id"]},
+        {"$set": {"account_status": "PENDING_DELETION",
+                  "deletion_scheduled_at": purge_at,
+                  "deletion_requested_at": now.isoformat()}})
+    return {"account_status": "PENDING_DELETION", "deletion_scheduled_at": purge_at,
+            "grace_days": ACCOUNT_GRACE_DAYS}
+
+@api.post("/account/restore")
+async def account_restore(user=Depends(get_current_user)):
+    """Cancel a pending deletion (or a break) and set the account back to ACTIVE."""
+    await db.users.update_one({"id": user["id"]},
+        {"$set": {"account_status": "ACTIVE"},
+         "$unset": {"deletion_scheduled_at": "", "deletion_requested_at": "", "paused_at": ""}})
+    return {"account_status": "ACTIVE"}
 
 @api.post("/payments/checkout")
 async def create_checkout(req: CheckoutReq, user=Depends(get_current_user)):
@@ -3900,6 +3954,31 @@ async def _date_lifecycle_loop():
             logging.error(f"date-lifecycle loop error: {ex}")
         await asyncio.sleep(60)
 
+async def _run_account_purge():
+    """Permanently delete accounts whose 30-day PENDING_DELETION grace period has expired."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    due = await db.users.find({"account_status": "PENDING_DELETION",
+                               "deletion_scheduled_at": {"$lte": now_iso}},
+                              {"_id": 0, "id": 1}).to_list(500)
+    for u in due:
+        try:
+            await _purge_user(u["id"])
+            logging.info(f"account-purge: permanently deleted user {u['id']}")
+        except Exception as ex:
+            logging.error(f"account-purge failed for {u['id']}: {ex}")
+    return len(due)
+
+async def _account_purge_loop():
+    """Internal background worker that purges expired accounts hourly."""
+    import asyncio
+    await asyncio.sleep(30)
+    while True:
+        try:
+            await _run_account_purge()
+        except Exception as ex:
+            logging.error(f"account-purge loop error: {ex}")
+        await asyncio.sleep(3600)  # hourly
+
 async def _run_spin_reminders():
     now = _now(); month = now.strftime("%Y-%m")
     users = await db.users.find({"spin_email_month": {"$ne": month}}, {"_id": 0, "id": 1}).to_list(500)
@@ -3928,6 +4007,14 @@ async def cron_spin(authorization: Optional[str] = Header(None)):
     import asyncio
     _cron_auth(authorization)
     asyncio.create_task(_run_spin_reminders())
+    return {"accepted": True}
+
+@api.post("/cron/purge-accounts")
+async def cron_purge_accounts(authorization: Optional[str] = Header(None)):
+    # Permanently purge accounts whose 30-day deletion grace period has expired.
+    import asyncio
+    _cron_auth(authorization)
+    asyncio.create_task(_run_account_purge())
     return {"accepted": True}
 
 app.include_router(api)

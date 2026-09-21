@@ -33,6 +33,7 @@ import Appeals from "@/pages/Appeals";
 import Fraud from "@/pages/Fraud";
 import { PaymentSuccess, PaymentCancel } from "@/pages/PaymentResult";
 import SupportChat from "@/components/SupportChat";
+import RestoreAccountBanner from "@/components/RestoreAccountBanner";
 
 const Private = ({ children }) => {
   const { user, loading } = useApp();
@@ -44,6 +45,7 @@ const Private = ({ children }) => {
 const Shell = () => (
   <>
     <Nav />
+    <RestoreAccountBanner />
     <Routes>
       <Route path="/" element={<Landing />} />
       <Route path="/auth" element={<Auth />} />
