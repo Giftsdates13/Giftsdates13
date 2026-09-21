@@ -31,18 +31,26 @@ export default function DateBookingModal({ open, onOpenChange, target }) {
   const busySet = new Set(avail.busy_days);
   const availSet = new Set(avail.available_days);
   const win = day ? ((avail.slots || {})[day] || avail.time_window) : avail.time_window;
-  // Build 3-hour slots from the availability window (matches backend gen_slots)
+  // Build 2.5-hour slots from the availability window (matches backend gen_slots). Windows whose
+  // end is <= start run past midnight into the next day.
   const hmMin = (s) => { const [h, m] = String(s || "0:0").split(":").map(Number); return (h || 0) * 60 + (m || 0); };
-  const minHm = (x) => `${String(Math.floor(x / 60)).padStart(2, "0")}:${String(x % 60).padStart(2, "0")}`;
+  const minHm = (x) => { const v = ((x % 1440) + 1440) % 1440; return `${String(Math.floor(v / 60)).padStart(2, "0")}:${String(v % 60).padStart(2, "0")}`; };
   const genSlots = (w) => {
-    const start = hmMin(w?.from || "18:00"), end = hmMin(w?.to || "23:00");
-    const out = []; for (let s = start; s + 150 <= end; s += 150) out.push({ from: minHm(s), to: minHm(s + 150) });
+    const start = hmMin(w?.from || "18:00"); let end = hmMin(w?.to || "23:00"); if (end <= start) end += 1440;
+    const out = []; for (let s = start; s + 150 <= end; s += 150) out.push({ from: minHm(s), to: minHm(s + 150), nextDay: s + 150 >= 1440 });
     return out;
   };
   const daySlots = day ? genSlots(win) : [];
   const dayBusy = (avail.busy_slots || {})[day] || [];
-  // A slot is unavailable if it overlaps a booked date's locked window (date +/- 15-min buffer)
-  const slotBusy = (s) => dayBusy.some(b => hmMin(b.lock_from || b.from) < hmMin(s.to) && hmMin(s.from) < hmMin(b.lock_to || b.to));
+  // A slot is unavailable if it overlaps a booked date's locked window (date +/- 15-min buffer).
+  // Normalise past-midnight ranges so end always sits after start before comparing.
+  const slotBusy = (s) => {
+    let sf = hmMin(s.from), st = hmMin(s.to); if (st <= sf) st += 1440;
+    return dayBusy.some(b => {
+      let bf = hmMin(b.lock_from || b.from), bt = hmMin(b.lock_to || b.to); if (bt <= bf) bt += 1440;
+      return bf < st && sf < bt;
+    });
+  };
   const timeOk = daySlots.some(s => s.from === time && !slotBusy(s));
   const isDisabled = (d) => {
     const k = toKey(d);
@@ -142,7 +150,7 @@ export default function DateBookingModal({ open, onOpenChange, target }) {
                           taken ? "bg-rose-500/10 border-rose-500/30 text-rose-300/60 line-through cursor-not-allowed"
                           : active ? "bg-rose-500 border-rose-500 text-white"
                           : "bg-white/5 border-white/10 text-slate-200 hover:bg-white/10"}`}>
-                        <div>{s.from}–{s.to}</div>
+                        <div>{s.from}–{s.to}{s.nextDay ? <span className="ml-0.5 text-sky-300/90">+1</span> : ""}</div>
                         {taken && <div className="text-[9px] mt-0.5 no-underline">{t("slot_booked", lang)}</div>}
                       </button>
                     );

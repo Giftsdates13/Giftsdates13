@@ -11,8 +11,9 @@ import { t } from "../lib/i18n";
 import { toKey, fromKey } from "./AvailabilityCalendar";
 
 const hmMin = (s) => { const [h, m] = String(s || "0:0").split(":").map(Number); return (h || 0) * 60 + (m || 0); };
-const minHm = (x) => `${String(Math.floor(x / 60)).padStart(2, "0")}:${String(x % 60).padStart(2, "0")}`;
-const genSlots = (w) => { const start = hmMin(w?.from || "18:00"), end = hmMin(w?.to || "23:00"); const out = []; for (let s = start; s + 150 <= end; s += 150) out.push({ from: minHm(s), to: minHm(s + 150) }); return out; };
+const minHm = (x) => { const v = ((x % 1440) + 1440) % 1440; return `${String(Math.floor(v / 60)).padStart(2, "0")}:${String(v % 60).padStart(2, "0")}`; };
+// Windows whose end is <= start run past midnight into the next day.
+const genSlots = (w) => { const start = hmMin(w?.from || "18:00"); let end = hmMin(w?.to || "23:00"); if (end <= start) end += 1440; const out = []; for (let s = start; s + 150 <= end; s += 150) out.push({ from: minHm(s), to: minHm(s + 150), nextDay: s + 150 >= 1440 }); return out; };
 
 export default function InviteDateModal({ open, onOpenChange, target }) {
   const { user, lang, refreshUser } = useApp();
@@ -39,7 +40,13 @@ export default function InviteDateModal({ open, onOpenChange, target }) {
   const win = day ? ((avail.slots || {})[day] || avail.time_window) : avail.time_window;
   const daySlots = day ? genSlots(win) : [];
   const dayBusy = (avail.busy_slots || {})[day] || [];
-  const slotBusy = (s) => dayBusy.some(b => hmMin(b.lock_from || b.from) < hmMin(s.to) && hmMin(s.from) < hmMin(b.lock_to || b.to));
+  const slotBusy = (s) => {
+    let sf = hmMin(s.from), st = hmMin(s.to); if (st <= sf) st += 1440;
+    return dayBusy.some(b => {
+      let bf = hmMin(b.lock_from || b.from), bt = hmMin(b.lock_to || b.to); if (bt <= bf) bt += 1440;
+      return bf < st && sf < bt;
+    });
+  };
   const isDisabled = (d) => {
     const k = toKey(d);
     if (d < new Date(new Date().setHours(0, 0, 0, 0))) return true;
@@ -125,7 +132,7 @@ export default function InviteDateModal({ open, onOpenChange, target }) {
                   return (
                     <button key={s.from} type="button" disabled={taken} onClick={() => setTime(s.from)} data-testid={`invite-slot-${s.from}`}
                       className={`rounded-lg border px-2 py-2 text-xs font-mono-num transition-colors ${taken ? "bg-rose-500/10 border-rose-500/30 text-rose-300/60 line-through cursor-not-allowed" : active ? "bg-rose-500 border-rose-500 text-white" : "bg-white/5 border-white/10 text-slate-200 hover:bg-white/10"}`}>
-                      {s.from}–{s.to}
+                      {s.from}–{s.to}{s.nextDay ? <span className="ml-0.5 text-sky-300/90">+1</span> : ""}
                     </button>
                   );
                 })}

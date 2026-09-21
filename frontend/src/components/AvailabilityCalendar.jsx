@@ -11,10 +11,13 @@ export const toKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padSt
 export const fromKey = (k) => { const [y, m, d] = k.split("-").map(Number); return new Date(y, m - 1, d); };
 const DEFAULT_WIN = { from: "18:00", to: "23:00" };
 const hmMin = (s) => { const [h, m] = String(s || "0:0").split(":").map(Number); return (h || 0) * 60 + (m || 0); };
-const minHm = (x) => `${String(Math.floor(x / 60)).padStart(2, "0")}:${String(x % 60).padStart(2, "0")}`;
+const minHm = (x) => { const v = ((x % 1440) + 1440) % 1440; return `${String(Math.floor(v / 60)).padStart(2, "0")}:${String(v % 60).padStart(2, "0")}`; };
+// End minute of a window, extended past 1440 when it runs into the next day (to <= from).
+const winEnd = (w) => { const start = hmMin(w?.from || "18:00"); let end = hmMin(w?.to || "23:00"); if (end <= start) end += 1440; return { start, end }; };
+export const crossesMidnight = (w) => hmMin(w?.to) <= hmMin(w?.from);
 export const genSlots = (w) => {
-  const start = hmMin(w?.from || "18:00"), end = hmMin(w?.to || "23:00");
-  const out = []; for (let s = start; s + 150 <= end; s += 150) out.push({ from: minHm(s), to: minHm(s + 150) });
+  const { start, end } = winEnd(w);
+  const out = []; for (let s = start; s + 150 <= end; s += 150) out.push({ from: minHm(s), to: minHm(s + 150), nextDay: s + 150 >= 1440 });
   return out;
 };
 
@@ -25,10 +28,13 @@ function SlotPreview({ win, lang }) {
     <div className="mt-3" data-testid="slot-preview">
       <p className="text-[11px] text-slate-400 mb-1.5">{t("slot_hours_note", lang)}</p>
       <p className="text-[11px] text-amber-300/80 mb-1.5">🔒 {t("buffer_note", lang)}</p>
+      {crossesMidnight(win) && (
+        <p className="text-[11px] text-sky-300/90 mb-1.5" data-testid="slot-overnight-note">🌙 {t("overnight_note", lang)}</p>
+      )}
       <div className="flex flex-wrap gap-1.5">
         {slots.map(s => (
           <span key={s.from} className="text-[11px] px-2 py-0.5 rounded-md bg-emerald-500/15 border border-emerald-500/30 text-emerald-200 font-mono-num">
-            {s.from}–{s.to}
+            {s.from}–{s.to}{s.nextDay ? <span className="ml-0.5 text-sky-300/90">+1</span> : ""}
           </span>
         ))}
       </div>
@@ -79,7 +85,7 @@ export default function AvailabilityCalendar({ value = [], onChange, timeWindow,
               {value.slice(0, 40).map(k => (
                 <button key={k} type="button" data-testid={`profile-day-chip-${k}`} onClick={() => setEditDay(editDay === k ? null : k)}
                   className={`px-2 py-0.5 rounded-full border text-xs font-mono-num transition-colors ${editDay === k ? "bg-rose-500 text-white border-rose-500" : slots[k] ? "bg-violet-500/20 border-violet-500/40 text-violet-200" : "bg-rose-500/15 border-rose-500/30"}`}>
-                  {k}{slots[k] ? ` · ${slots[k].from}–${slots[k].to}` : ""}
+                  {k}{slots[k] ? ` · ${slots[k].from}–${slots[k].to}${crossesMidnight(slots[k]) ? " 🌙" : ""}` : ""}
                 </button>
               ))}
             </div>

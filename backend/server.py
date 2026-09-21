@@ -951,7 +951,7 @@ async def update_me(patch: ProfileUpdate, user=Depends(get_current_user)):
         upd["passport_cities"] = cleaned
     if "availability" in upd:
         upd["availability"] = sorted({d[:10] for d in upd["availability"] if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d[:10])})
-    def _win_ok(w): return isinstance(w, dict) and re.fullmatch(r"\d{2}:\d{2}", str(w.get("from", ""))) and re.fullmatch(r"\d{2}:\d{2}", str(w.get("to", ""))) and w["from"] < w["to"]
+    def _win_ok(w): return isinstance(w, dict) and re.fullmatch(r"\d{2}:\d{2}", str(w.get("from", ""))) and re.fullmatch(r"\d{2}:\d{2}", str(w.get("to", ""))) and w["from"] != w["to"]  # to <= from means the window runs past midnight into the next day
     if "availability_time" in upd and upd["availability_time"] and not _win_ok(upd["availability_time"]): raise HTTPException(400, "Invalid time window")
     if "availability_slots" in upd:
         upd["availability_slots"] = {k[:10]: v for k, v in (upd["availability_slots"] or {}).items() if re.fullmatch(r"\d{4}-\d{2}-\d{2}", k[:10]) and _win_ok(v)}
@@ -1699,14 +1699,23 @@ def _hm_to_min(s):
         return 0
 
 def _min_to_hm(x):
-    x = max(0, min(24 * 60, int(x))); return f"{x // 60:02d}:{x % 60:02d}"
+    # Wrap around the clock so minutes past midnight (e.g. 1530 = 25:30) display as the next-day time (01:30).
+    x = int(x) % (24 * 60); return f"{x // 60:02d}:{x % 60:02d}"
 
-def gen_slots(win):
-    """Split an availability window into consecutive 3-hour slots.
-    e.g. win 12:00-21:00 -> [12:00-15:00, 15:00-18:00, 18:00-21:00]."""
+def _win_end_min(win):
+    """End minute of a window, extended past 1440 when it runs into the next day (to <= from)."""
     win = win or {"from": "18:00", "to": "23:00"}
     start = _hm_to_min(win.get("from", "18:00"))
     end = _hm_to_min(win.get("to", "23:00"))
+    if end <= start:
+        end += 24 * 60
+    return start, end
+
+def gen_slots(win):
+    """Split an availability window into consecutive 2.5-hour slots.
+    e.g. win 12:00-21:00 -> [12:00-14:30, 14:30-17:00, ...]. Windows whose
+    end is <= start run past midnight (e.g. 22:00-02:00) into the next day."""
+    start, end = _win_end_min(win)
     step = DATE_SLOT_MINUTES
     slots = []
     s = start
@@ -1728,7 +1737,9 @@ def _booking_start_min(b):
 
 def _booking_end_min(b):
     if b.get("slot_to"):
-        return _hm_to_min(b["slot_to"])
+        e = _hm_to_min(b["slot_to"]); s = _booking_start_min(b)
+        if e <= s: e += 24 * 60  # date ends after midnight (next day)
+        return e
     return _booking_start_min(b) + DATE_SLOT_MINUTES
 
 @api.post("/dates/book")
@@ -1754,12 +1765,20 @@ async def book_date(req: DateBookingReq, user=Depends(get_current_user)):
     except Exception:
         local_t = req.local_time or "00:00"
     start_min = _hm_to_min(local_t)
-    end_min = start_min + DATE_SLOT_MINUTES
-    slot_from, slot_to = _min_to_hm(start_min), _min_to_hm(end_min)
     if win:
-        # The chosen 2.5h date must fit inside the availability window
-        if not (_hm_to_min(win["from"]) <= start_min and end_min <= _hm_to_min(win["to"])):
+        # The chosen 2.5h date must fit inside the availability window (which may run past midnight).
+        win_start, win_end = _win_end_min(win)
+        eff_start = start_min
+        # An early-morning start time that falls after a past-midnight window belongs to the "next day" side.
+        if win_end > 24 * 60 and eff_start < win_start:
+            eff_start += 24 * 60
+        eff_end = eff_start + DATE_SLOT_MINUTES
+        if not (win_start <= eff_start and eff_end <= win_end):
             raise HTTPException(400, f"TIME_UNAVAILABLE:{win['from']}-{win['to']}")
+        start_min, end_min = eff_start, eff_end
+    else:
+        end_min = start_min + DATE_SLOT_MINUTES
+    slot_from, slot_to = _min_to_hm(start_min), _min_to_hm(end_min)
     # 3-hour slot conflict check + 15-min buffer locked before AND after each date
     day_bookings = await db.date_bookings.find({"status": {"$in": ["escrow", "accepted", "confirmed"]},
                                                 "scheduled_at": {"$regex": f"^{day}"},
@@ -1843,7 +1862,12 @@ async def profile_availability(pid: str, user=Depends(get_current_user)):
         all_slots = gen_slots(win)
         def _overlaps(s):
             sf, st = _hm_to_min(s["from"]), _hm_to_min(s["to"])
-            return any(_hm_to_min(t["lock_from"]) < st and sf < _hm_to_min(t["lock_to"]) for t in taken)
+            if st <= sf: st += 24 * 60  # slot ends after midnight
+            def _t(t):
+                lf, lt = _hm_to_min(t["lock_from"]), _hm_to_min(t["lock_to"])
+                if lt <= lf: lt += 24 * 60
+                return lf, lt
+            return any((lambda lf, lt: lf < st and sf < lt)(*_t(t)) for t in taken)
         if all_slots and all(_overlaps(s) for s in all_slots):
             fully_booked.append(d)
     return {"available_days": p.get("availability") or [], "busy_days": sorted(fully_booked),

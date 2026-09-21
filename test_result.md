@@ -93,6 +93,23 @@
 user_problem_statement: "Restore/clone the full GiftsDates luxury dating full-stack app from GitHub (giftsdates11/giftsdates11) into /app, preserving all logins (auth) and design/texture. Verify it runs."
 
 backend:
+  - task: "Availability window crossing midnight (overnight slots into next day)"
+    implemented: true
+    working: true
+    file: "server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        -working: "NA"
+        -agent: "main"
+        -comment: "Added support for availability time windows that pass midnight into the next day (to <= from means overnight). Changes: (1) _win_ok now allows from != to (previously required from < to) so PUT /api/profile with availability_time or availability_slots like {from:'22:00',to:'02:00'} is accepted. (2) Added _win_end_min helper; gen_slots extends end by 1440 when it crosses midnight. (3) _min_to_hm now wraps modulo 24h so 25:30 displays as 01:30. (4) _booking_end_min adds 1440 when slot end <= start. (5) POST /api/dates/book validation now fits a 2.5h date inside an overnight window (early-morning start times are treated as next-day). (6) profile_availability _overlaps normalizes past-midnight ranges. TEST: register two users; set userA availability_time {from:'22:00',to:'02:00'} and an available day; GET /api/profiles/{A}/availability should return that time_window and not error; POST /api/dates/book from userB to userA with local_time '23:00' on that day should succeed (slot_from 23:00, slot_to 01:30); booking at '01:00' should be rejected (TIME_UNAVAILABLE, <150min left); also verify a normal same-day window (18:00-23:00) still works. Ensure PUT /api/profile with availability_time {from:'18:00',to:'18:00'} (equal) is rejected as invalid."
+        -working: true
+        -agent: "testing"
+        -comment: "✅ OVERNIGHT AVAILABILITY FEATURE FULLY WORKING (ALL TESTS PASSED 8/8). Tested complete flow: 1) Registered two users (userA, userB) via POST /api/auth/register. 2) As userA, PATCH /api/auth/me with availability_time={from:'22:00',to:'02:00'} and availability=[future date 3 days out] → 200 OK (overnight window accepted). Verified profile saved these values correctly. 3) As userA, PATCH /api/auth/me with availability_time={from:'18:00',to:'18:00'} (equal from==to) → 400 'Invalid time window' (correctly rejected). Restored overnight window. 4) GET /api/profiles/{userA_id}/availability as userB → 200 OK, time_window={from:'22:00',to:'02:00'}, available_days contains future date. No errors. 5) Added 500 coins to userB via database (register grants 0 coins). 6) POST /api/dates/book from userB to userA with scheduled_at=<future date>T22:00:00, local_time='23:00', activities=[3 strings], coins=150, venue/city/address/country/postal_code → 200 OK, status='escrow', booking_id returned. Verified stored booking: slot_from='23:00', slot_to='01:30' (date ends after midnight next day). 7) NEGATIVE TEST: POST /api/dates/book with local_time='01:00' on same day → 400 'TIME_UNAVAILABLE:22:00-02:00' (correctly rejected - only 60 min remain before 02:00, 2.5h/150-min date won't fit). 8) REGRESSION TEST: Set userA availability_time={from:'18:00',to:'23:00'} for different future date, POST /api/dates/book from userB at local_time='18:00' → 200 OK, slot_from='18:00', slot_to='20:30' (normal same-day windows still work). Test file: /app/backend_overnight_availability_test.py. Test users: userA_fbe47c9a@example.com (ID: 4c2309ed-4101-4f77-9d05-3804e90301a5), userB_32cd6225@example.com (ID: 10e19ffb-e8f7-4f24-9d57-ed920c7e68e9). NO ISSUES FOUND."
+
+
+backend:
   - task: "App restoration - backend boots and serves /api"
     implemented: true
     working: true
@@ -737,3 +754,104 @@ INVITATION_SENT
     -message: "Test POST /api/invites/{did}/pickup/reject. Walk the flow to PICKUP_ADDRESS_PENDING (register 2 users, seed inviter coins, invite, accept/select activity, inviter proposes location, invited requests taxi, inviter offers pickup via /pickup/offer). Then as the INVITED user call /pickup/reject and verify: (1) 200 and status becomes CANCELLED, (2) ALL escrow coins refunded to the INVITER, (3) invited user's locked_slots has reason 'rejected_date', (4) future invite for the same slot blocked with SLOT_LOCKED. Negative: inviter cannot call it (recipient-only, 403), and it fails (400) outside PICKUP_ADDRESS_PENDING. Also confirm the accept path (/pickup/address) still works. Reference backend_location_reject_test.py and backend_pickup_address_test.py. Do NOT test Stripe."
     -agent: "testing"
     -message: "✅ PICKUP REJECTION ENDPOINT TEST COMPLETE - ALL TESTS PASSED (4/4). The pickup rejection endpoint is fully functional. FLOW VERIFIED: Full escrow date flow from INVITATION_SENT → DATE_ACTIVITY_SELECTED → LOCATION_PROPOSED → TAXI_REQUESTED → PICKUP_ADDRESS_PENDING → CANCELLED (via rejection). ENDPOINTS TESTED: POST /api/invites (create invite with activity_option_1/2/3 + scheduled_start), POST /api/invites/{did}/choose (recipient chooses activity), POST /api/invites/{did}/location (inviter proposes location), POST /api/invites/{did}/taxi/request (recipient requests taxi), POST /api/invites/{did}/pickup/offer (inviter offers pickup), POST /api/invites/{did}/pickup/reject (recipient rejects date), POST /api/invites/{did}/pickup/address (recipient submits pickup address - regression test), GET /api/invites/{did} (verify date status), GET /api/auth/me (verify coin balance and locked_slots). VERIFIED: (1) Recipient can reject date at pickup stage: 200 response, status becomes CANCELLED. (2) Full refund to inviter: ALL escrow coins (300) returned to inviter, balance went from 9100 (after escrow) back to 9400 (original). (3) Recipient slot locked: locked_slots entry created with reason='rejected_date', start=scheduled_start, date_id=did. (4) Future invite blocked: Attempting to create a new invite for the same slot fails as expected. (5) Negative test: Inviter cannot reject (403 Forbidden - recipient-only endpoint). (6) Negative test: Cannot reject at wrong status (400 Bad Request when status is not PICKUP_ADDRESS_PENDING). (7) Regression test: Accept path (/pickup/address) still works - submitted pickup address with coordinates, status becomes PICKUP_ADDRESS_SELECTED. NO ISSUES FOUND. Test users: premv3@example.com (inviter with 9400 coins), fresh test recipients. Test file: /app/backend_pickup_reject_test.py."
+
+    -agent: "main"
+    -message: "NEW FEATURE TO TEST: Availability windows that pass midnight into the next day. Please focus ONLY on this. Steps: (1) Register userA and userB. (2) PUT /api/profile as userA setting availability_time={from:'22:00',to:'02:00'} and availability=[<a future date, e.g. 3 days out YYYY-MM-DD>]. Expect 200 (previously this was rejected as 'Invalid time window'). (3) PUT /api/profile as userA with availability_time={from:'18:00',to:'18:00'} — expect 400 Invalid time window (equal from/to still invalid). (4) GET /api/profiles/{userA}/availability as userB — verify time_window={from:'22:00',to:'02:00'} returned and available_days contains the date. (5) Give userB coins (register grants some, or use test helper; date_min_coins ~150). POST /api/dates/book from userB to userA with scheduled_at=<that date>T22:00 (or local_time='23:00'), activities=[3 strings], coins>=min. Expect 200, status 'escrow', and the stored booking slot_from='23:00', slot_to='01:30'. (6) Negative: POST /api/dates/book with local_time='01:00' on that day — expect 400 TIME_UNAVAILABLE (only 90 min left before 02:00, a 2.5h date won't fit). (7) Regression: a normal window 18:00-23:00 booking at 18:00 still works. Do NOT test Stripe/payments. Backend URL from frontend/.env REACT_APP_BACKEND_URL, all routes prefixed with /api."
+    -agent: "testing"
+    -message: "✅ OVERNIGHT AVAILABILITY FEATURE TEST COMPLETE - ALL TESTS PASSED (8/8). The overnight availability feature is fully functional. FLOW VERIFIED: Complete overnight availability window testing from profile update → availability check → booking creation → negative test → regression test. ENDPOINTS TESTED: POST /api/auth/register (create users), PATCH /api/auth/me (update profile with availability_time and availability), GET /api/profiles/{user_id}/availability (verify time_window and available_days), POST /api/dates/book (create booking with overnight window), GET /api/dates (verify booking details). VERIFIED: (1) Overnight window (22:00-02:00) accepted by PATCH /api/auth/me: 200 OK, profile saved correctly. (2) Equal from==to (18:00-18:00) rejected: 400 'Invalid time window'. (3) GET /api/profiles/{id}/availability returns correct time_window={from:'22:00',to:'02:00'} and available_days. (4) Booking at local_time='23:00' succeeds: 200 OK, status='escrow', slot_from='23:00', slot_to='01:30' (date ends after midnight next day). (5) NEGATIVE TEST: Booking at local_time='01:00' rejected: 400 'TIME_UNAVAILABLE:22:00-02:00' (insufficient time - only 60 min remain before 02:00, 2.5h date won't fit). (6) REGRESSION TEST: Normal same-day window (18:00-23:00) still works: booking at 18:00 succeeds with slot_from='18:00', slot_to='20:30'. NO ISSUES FOUND. Test users: userA_fbe47c9a@example.com, userB_32cd6225@example.com. Test file: /app/backend_overnight_availability_test.py. NOTE: Register grants 0 coins, added 500 coins to userB via database for testing."
+
+
+
+## Testing Session 6 - 2026-09-21
+**Testing Agent**: Overnight Availability Feature Verification
+**Focus**: Availability windows that pass midnight into the next day
+
+### Tests Executed:
+1. ✅ User Registration - POST /api/auth/register for userA and userB
+2. ✅ Overnight Window Profile Update - PATCH /api/auth/me with availability_time={from:'22:00',to:'02:00'} → 200 OK
+3. ✅ Equal From==To Validation - PATCH /api/auth/me with availability_time={from:'18:00',to:'18:00'} → 400 'Invalid time window'
+4. ✅ Overnight Window Restoration - PATCH /api/auth/me with availability_time={from:'22:00',to:'02:00'} → 200 OK
+5. ✅ Availability Endpoint - GET /api/profiles/{userA_id}/availability returns time_window and available_days
+6. ✅ Coin Addition - Added 500 coins to userB via database (register grants 0 coins)
+7. ✅ Overnight Booking Success - POST /api/dates/book with local_time='23:00' → 200 OK, slot_from='23:00', slot_to='01:30'
+8. ✅ Overnight Booking Negative Test - POST /api/dates/book with local_time='01:00' → 400 'TIME_UNAVAILABLE:22:00-02:00'
+9. ✅ Normal Window Regression Test - PATCH /api/auth/me with availability_time={from:'18:00',to:'23:00'} → 200 OK
+10. ✅ Normal Window Booking - POST /api/dates/book with local_time='18:00' → 200 OK, slot_from='18:00', slot_to='20:30'
+
+### Test Results: 10/10 PASSED (100%)
+
+### Overnight Availability Feature Verified:
+- **PATCH /api/auth/me**: Accepts overnight availability windows (from > to)
+  - Overnight window (22:00-02:00): ✅ Accepted (200 OK)
+  - Equal from==to (18:00-18:00): ✅ Rejected (400 'Invalid time window')
+  - Profile correctly saves availability_time and availability fields
+
+- **GET /api/profiles/{user_id}/availability**: Returns overnight time_window
+  - time_window: {'from': '22:00', 'to': '02:00'} ✅
+  - available_days: ['2026-09-24'] ✅
+  - No errors when processing overnight windows ✅
+
+- **POST /api/dates/book**: Handles overnight availability windows
+  - Booking at 23:00 (within 22:00-02:00 window): ✅ Success
+    - Status: 'escrow' ✅
+    - slot_from: '23:00' ✅
+    - slot_to: '01:30' (next day) ✅
+  - Booking at 01:00 (insufficient time): ✅ Rejected
+    - Error: 'TIME_UNAVAILABLE:22:00-02:00' ✅
+    - Reason: Only 60 min remain before 02:00, 2.5h date won't fit ✅
+
+### Test Case 1: Overnight Window (22:00-02:00)
+- **UserA**: userA_fbe47c9a@example.com (ID: 4c2309ed-4101-4f77-9d05-3804e90301a5)
+- **UserB**: userB_32cd6225@example.com (ID: 10e19ffb-e8f7-4f24-9d57-ed920c7e68e9)
+- **Available Date**: 2026-09-24
+- **Booking Time**: 23:00 (within overnight window)
+- **Booking ID**: 7b89bed1-d7da-4dd0-9116-ee9066199bb5
+- **Result**: ✅ Booking created successfully
+  - slot_from: 23:00
+  - slot_to: 01:30 (next day)
+  - Status: escrow
+
+### Test Case 2: Negative - Insufficient Time
+- **Booking Time**: 01:00 (within overnight window but too late)
+- **Expected**: 400 'TIME_UNAVAILABLE:22:00-02:00'
+- **Actual**: 400 'TIME_UNAVAILABLE:22:00-02:00'
+- **Result**: ✅ Correctly rejected (only 60 min remain before 02:00, 2.5h date won't fit)
+
+### Test Case 3: Regression - Normal Same-Day Window
+- **Window**: 18:00-23:00
+- **Available Date**: 2026-09-25
+- **Booking Time**: 18:00
+- **Result**: ✅ Booking created successfully
+  - slot_from: 18:00
+  - slot_to: 20:30
+  - Status: escrow
+
+### Implementation Details Verified:
+1. **_win_ok function** (line 954): Allows from != to (overnight windows accepted)
+2. **_win_end_min function** (line 1705): Extends end by 1440 when end <= start (overnight)
+3. **_min_to_hm function** (line 1701): Wraps modulo 24h (25:30 → 01:30)
+4. **_booking_end_min function** (line 1738): Adds 1440 when slot end <= start
+5. **POST /api/dates/book** (line 1745): Validates 2.5h date fits inside overnight window
+6. **gen_slots function** (line 1714): Generates slots for overnight windows
+7. **profile_availability _overlaps** (line 1863): Normalizes past-midnight ranges
+
+### Environment Verified:
+- Backend URL: https://secure-gifts-3.preview.emergentagent.com/api
+- MongoDB: Connected and operational (localhost:27017)
+- All routes properly prefixed with /api
+- Test file: /app/backend_overnight_availability_test.py
+- Helper script: /app/add_coins.py (adds coins to users for testing)
+
+### Issues Found: NONE
+
+### Recommendations:
+- ✅ Overnight availability feature is production-ready
+- ✅ Profile update (PATCH /api/auth/me) correctly accepts overnight windows
+- ✅ Equal from==to validation working correctly (rejected as invalid)
+- ✅ Availability endpoint (GET /api/profiles/{id}/availability) returns correct data
+- ✅ Booking endpoint (POST /api/dates/book) correctly handles overnight windows
+- ✅ Slot calculation correct (slot_to wraps to next day: 01:30)
+- ✅ Negative test working (insufficient time correctly rejected)
+- ✅ Regression test passed (normal same-day windows still work)
+- ✅ All helper functions (_win_ok, _win_end_min, _min_to_hm, _booking_end_min, gen_slots) working correctly
+- ⚠️ Note: Register grants 0 coins, test added 500 coins via database for booking tests
